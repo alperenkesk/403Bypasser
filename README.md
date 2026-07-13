@@ -3,7 +3,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Go-1.20+-00ADD8?style=flat&logo=go" alt="Go Version">
   <img src="https://img.shields.io/badge/License-MIT-yellow?style=flat" alt="License">
-  <img src="https://img.shields.io/badge/Version-1.1-orange?style=flat" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.2-orange?style=flat" alt="Version">
 </p>
 
 <p align="center">
@@ -87,6 +87,8 @@ make install
 | `--delay` | `-d` | Delay between requests in milliseconds | `0` |
 | `--deep` | `-D` | Enable Deep Scan (path × header × method fuzzing) | `false` |
 | `--show-codes` | `-s` | Status codes to report (comma-separated) | `200` |
+| `--filter-size` | `-f` | Filter out responses of specific sizes | — |
+| `--no-color` | `-n` | Disable colored output (auto-disabled when piping) | `false` |
 | `--verbose` | `-v` | Show errors and failed requests | `false` |
 | `--help` | `-h` | Show help | — |
 

@@ -6,7 +6,6 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,12 +22,11 @@ var defaultWordlist string
 
 const DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-const (
+// Color vars (not constants) so they can be blanked out by --no-color / non-TTY
+var (
 	ColorGreen  = "\033[92m"
 	ColorRed    = "\033[91m"
 	ColorYellow = "\033[93m"
-	ColorBlue   = "\033[94m"
-	ColorPurple = "\033[95m"
 	ColorCyan   = "\033[96m"
 	ColorReset  = "\033[0m"
 )
@@ -44,11 +42,14 @@ var (
 	delay         int
 	deepMode      bool
 	verboseMode   bool
+	noColor       bool
 	showCodes     []int
+	filterSizes   []int
 	customHeaders []string
 
-	fileMutex sync.Mutex
-	printLock sync.Mutex
+	fileMutex   sync.Mutex
+	printLock   sync.Mutex
+	resultsFile *os.File
 
 	calibrationSize404  int
 	calibrationSizeRoot int
@@ -67,15 +68,19 @@ var rootCmd = &cobra.Command{
 	Use:   "403bypasser",
 	Short: "Advanced 403/401 Bypasser & Access Control Fuzzer",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("\033[36m" + `
+		if noColor || !isTerminal() {
+			disableColors()
+		}
+
+		fmt.Println(ColorCyan + `
 ██╗  ██╗ ██████╗ ██████╗   ██████╗ ██╗   ██╗██████╗  █████╗ ███████╗███████╗███████╗██████╗
 ██║  ██║██╔═████╗╚════██╗  ██╔══██╗╚██╗ ██╔╝██╔══██╗██╔══██╗██╔════╝██╔════╝██╔════╝██╔══██╗
 ███████║██║██╔██║ █████╔╝  ██████╔╝ ╚████╔╝ ██████╔╝███████║███████╗███████╗█████╗  ██████╔╝
 ╚════██║████╔╝██║ ╚═══██╗  ██╔══██╗  ╚██╔╝  ██╔═══╝ ██╔══██║╚════██║╚════██║██╔══╝  ██╔══██╗
      ██║╚██████╔╝██████╔╝  ██████╔╝   ██║   ██║     ██║  ██║███████║███████║███████╗██║  ██║
      ╚═╝ ╚═════╝ ╚═════╝   ╚═════╝    ╚═╝   ╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝
-` + "\033[0m")
-		fmt.Println("    \033[32mv1.0 | Advanced 403/401 Bypasser & Access Control Fuzzer\033[0m\n")
+` + ColorReset)
+		fmt.Println("    " + ColorGreen + "v1.2 | Advanced 403/401 Bypasser & Access Control Fuzzer" + ColorReset + "\n")
 
 		if targetURL == "" {
 			cmd.Help()
@@ -96,8 +101,26 @@ func init() {
 	rootCmd.Flags().IntVarP(&delay, "delay", "d", 0, "Delay between requests in milliseconds (ms)")
 	rootCmd.Flags().BoolVarP(&deepMode, "deep", "D", false, "Enable Deep Scan Mode (Nested Fuzzing)")
 	rootCmd.Flags().BoolVarP(&verboseMode, "verbose", "v", false, "Show errors and failed requests")
+	rootCmd.Flags().BoolVarP(&noColor, "no-color", "n", false, "Disable colored output")
 	rootCmd.Flags().IntSliceVarP(&showCodes, "show-codes", "s", []int{200}, "HTTP status codes to report (e.g. -s 200,301,302)")
+	rootCmd.Flags().IntSliceVarP(&filterSizes, "filter-size", "f", []int{}, "Filter out responses of specific sizes (e.g. -f 1234,5678)")
 	rootCmd.Flags().StringSliceVarP(&customHeaders, "header", "H", []string{}, "Custom Header (e.g. -H 'Auth: Bearer 123')")
+}
+
+func isTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+func disableColors() {
+	ColorGreen = ""
+	ColorRed = ""
+	ColorYellow = ""
+	ColorCyan = ""
+	ColorReset = ""
 }
 
 func startScan() {
@@ -117,15 +140,24 @@ func startScan() {
 
 	baseURL := strings.TrimRight(targetURL, "/")
 
+	// Open output file once and keep it open for the entire scan
+	f, err := os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf("%s[!] Cannot open output file: %v%s\n", ColorRed, err, ColorReset)
+		os.Exit(1)
+	}
+	defer f.Close()
+	resultsFile = f
+
 	var wordlistReader io.Reader
 	if wordlistPath != "" {
-		f, err := os.Open(wordlistPath)
+		wf, err := os.Open(wordlistPath)
 		if err != nil {
 			fmt.Printf("%s[!] Wordlist Error: %v%s\n", ColorRed, err, ColorReset)
 			os.Exit(1)
 		}
-		defer f.Close()
-		wordlistReader = f
+		defer wf.Close()
+		wordlistReader = wf
 		fmt.Printf("%s[*] Wordlist: %s%s\n", ColorCyan, wordlistPath, ColorReset)
 	} else {
 		wordlistReader = strings.NewReader(defaultWordlist)
@@ -135,6 +167,7 @@ func startScan() {
 	seen := make(map[string]bool)
 	var directories []string
 	scanner := bufio.NewScanner(wordlistReader)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line != "" && !strings.HasPrefix(line, "#") && !seen[line] {
@@ -175,7 +208,7 @@ func startScan() {
 
 	fmt.Printf("%s[*] Target: %s\n", ColorYellow, baseURL)
 
-	calibrate(client, baseURL, customHeadersMap)
+	calibrate(client, baseURL, customHeadersMap, cookieString)
 
 	fmt.Printf("[*] Threads: %d\n", threads)
 	fmt.Printf("[*] Timeout: %ds\n", timeout)
@@ -203,7 +236,10 @@ func startScan() {
 
 	fmt.Printf("[*] Mode: %s\n", mode)
 	fmt.Printf("[*] Output: %s\n", outputFile)
-	fmt.Printf("[*] Show Codes: %v\n", showCodes)
+	fmt.Printf("[*] Show Codes: %s\n", formatCodes(showCodes))
+	if len(filterSizes) > 0 {
+		fmt.Printf("[*] Filter Sizes: %s bytes\n", formatSizes(filterSizes))
+	}
 	fmt.Printf("[*] Custom Headers: %d\n", len(customHeadersMap))
 	fmt.Printf("[*] Paths to Scan: %d (after dedup)\n", len(directories))
 	fmt.Printf("[*] Estimated Requests: ~%s\n", formatCount(estimatedRequests))
@@ -246,17 +282,12 @@ func startScan() {
 func saveResult(result string) {
 	fileMutex.Lock()
 	defer fileMutex.Unlock()
-
-	f, err := os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
+	if resultsFile != nil {
+		resultsFile.WriteString(result + "\n")
 	}
-	defer f.Close()
-
-	f.WriteString(result + "\n")
 }
 
-func calibrate(client *http.Client, baseURL string, customHeaders map[string]string) {
+func calibrate(client *http.Client, baseURL string, customHeaders map[string]string, cookies string) {
 	fmt.Println(ColorYellow + "[*] Starting Calibration..." + ColorReset)
 
 	randomURL := fmt.Sprintf("%s/calibration_%d", baseURL, time.Now().UnixNano())
@@ -264,6 +295,9 @@ func calibrate(client *http.Client, baseURL string, customHeaders map[string]str
 	req404, err := http.NewRequest("GET", randomURL, nil)
 	if err == nil {
 		req404.Header.Set("User-Agent", DefaultUserAgent)
+		if cookies != "" {
+			req404.Header.Set("Cookie", cookies)
+		}
 		for k, v := range customHeaders {
 			req404.Header.Set(k, v)
 		}
@@ -282,6 +316,9 @@ func calibrate(client *http.Client, baseURL string, customHeaders map[string]str
 	reqRoot, err := http.NewRequest("GET", baseURL+"/", nil)
 	if err == nil {
 		reqRoot.Header.Set("User-Agent", DefaultUserAgent)
+		if cookies != "" {
+			reqRoot.Header.Set("Cookie", cookies)
+		}
 		for k, v := range customHeaders {
 			reqRoot.Header.Set(k, v)
 		}
@@ -322,12 +359,10 @@ func generateHeaders(targetPath string) []map[string]string {
 		}
 	}
 
-	// URL override headers take a path value
 	for _, key := range []string{"X-Original-URL", "X-Rewrite-URL", "X-Forwarded-URL"} {
 		headersList = append(headersList, map[string]string{key: targetPath})
 	}
 
-	// X-Forwarded-Scheme takes a scheme, not a path
 	headersList = append(headersList, map[string]string{"X-Forwarded-Scheme": "http"})
 	headersList = append(headersList, map[string]string{"X-Forwarded-Scheme": "https"})
 
@@ -408,8 +443,9 @@ func generatePathPayloads(originalPath string) []string {
 		fmt.Sprintf("/%s;.css", cleanPath),
 		fmt.Sprintf("/%s;.js", cleanPath),
 
+		// NOTE: /%s# is intentionally omitted — HTTP fragments are stripped
+		// by the client before sending and never reach the server.
 		fmt.Sprintf("/%s?", cleanPath),
-		fmt.Sprintf("/%s#", cleanPath),
 	}
 
 	return deduplicatePayloads(payloads)
@@ -425,6 +461,22 @@ func deduplicatePayloads(payloads []string) []string {
 		}
 	}
 	return result
+}
+
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func isFilteredSize(size int) bool {
+	for _, fs := range filterSizes {
+		if size == fs {
+			return true
+		}
+	}
+	return false
 }
 
 func isTargetStatus(status int) bool {
@@ -459,6 +511,22 @@ func formatCount(n int64) string {
 	return fmt.Sprintf("%d", n)
 }
 
+func formatCodes(codes []int) string {
+	parts := make([]string, len(codes))
+	for i, c := range codes {
+		parts[i] = fmt.Sprintf("%d", c)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func formatSizes(sizes []int) string {
+	parts := make([]string, len(sizes))
+	for i, s := range sizes {
+		parts[i] = fmt.Sprintf("%d", s)
+	}
+	return strings.Join(parts, ", ")
+}
+
 func sendRequest(client *http.Client, targetURL string, cookies string, headers map[string]string, customHeaders map[string]string, method, label string) {
 	req, err := http.NewRequest(method, targetURL, nil)
 	if err != nil {
@@ -470,8 +538,13 @@ func sendRequest(client *http.Client, targetURL string, cookies string, headers 
 		return
 	}
 
-	// Set default User-Agent first so -H "User-Agent: X" can override it
+	// Default UA first so -H "User-Agent: X" can override it
 	req.Header.Set("User-Agent", DefaultUserAgent)
+
+	// PUT without Content-Type gets rejected by many servers
+	if method == "PUT" {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
 
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -507,27 +580,21 @@ func sendRequest(client *http.Client, targetURL string, cookies string, headers 
 	size := len(bodyBytes)
 	status := resp.StatusCode
 
-	// HEAD and OPTIONS never return a body; allow them through the size check
+	// HEAD and OPTIONS have no body by design; allow them through
 	sizeOK := size > 0 || method == "HEAD" || method == "OPTIONS"
 
-	// False positive filtering only applies to 200 responses with a body
+	// False positive filtering: only for 200 with a body (not HEAD/OPTIONS)
 	isFalsePositive := false
 	if status == 200 && method != "HEAD" && method != "OPTIONS" {
-		if calibrationOK404 {
-			diff404 := int(math.Abs(float64(size - calibrationSize404)))
-			if diff404 < 100 {
-				isFalsePositive = true
-			}
+		if calibrationOK404 && absInt(size-calibrationSize404) < 100 {
+			isFalsePositive = true
 		}
-		if calibrationOKRoot && !isFalsePositive {
-			diffRoot := int(math.Abs(float64(size - calibrationSizeRoot)))
-			if diffRoot < 100 {
-				isFalsePositive = true
-			}
+		if calibrationOKRoot && !isFalsePositive && absInt(size-calibrationSizeRoot) < 100 {
+			isFalsePositive = true
 		}
 	}
 
-	if isTargetStatus(status) && sizeOK && !isFalsePositive {
+	if isTargetStatus(status) && sizeOK && !isFalsePositive && !isFilteredSize(size) {
 		logMessage := fmt.Sprintf("[+] FOUND (%d) | %s | %s | URL: %s | Size: %d",
 			status, method, label, targetURL, size)
 
