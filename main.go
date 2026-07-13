@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	_ "embed"
 	"fmt"
 	"io"
 	"math"
@@ -11,10 +12,14 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
 )
+
+//go:embed wordlists/common.txt
+var defaultWordlist string
 
 const DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -29,19 +34,26 @@ const (
 )
 
 var (
-	targetURL           string
-	wordlistPath        string
-	cookieString        string
-	proxyURL            string
-	threads             int
-	delay               int
-	deepMode            bool
-	customHeaders       []string
+	targetURL     string
+	wordlistPath  string
+	cookieString  string
+	proxyURL      string
+	outputFile    string
+	threads       int
+	timeout       int
+	delay         int
+	deepMode      bool
+	verboseMode   bool
+	showCodes     []int
+	customHeaders []string
 
-	fileMutex           sync.Mutex
-	printLock           sync.Mutex
+	fileMutex sync.Mutex
+	printLock sync.Mutex
+
 	calibrationSize404  int
 	calibrationSizeRoot int
+	calibrationOK404    bool
+	calibrationOKRoot   bool
 )
 
 func main() {
@@ -56,7 +68,7 @@ var rootCmd = &cobra.Command{
 	Short: "Advanced 403/401 Bypasser & Access Control Fuzzer",
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("\033[36m" + `
-██╗  ██╗ ██████╗ ██████╗   ██████╗ ██╗   ██╗██████╗  █████╗ ███████╗███████╗███████╗██████╗ 
+██╗  ██╗ ██████╗ ██████╗   ██████╗ ██╗   ██╗██████╗  █████╗ ███████╗███████╗███████╗██████╗
 ██║  ██║██╔═████╗╚════██╗  ██╔══██╗╚██╗ ██╔╝██╔══██╗██╔══██╗██╔════╝██╔════╝██╔════╝██╔══██╗
 ███████║██║██╔██║ █████╔╝  ██████╔╝ ╚████╔╝ ██████╔╝███████║███████╗███████╗█████╗  ██████╔╝
 ╚════██║████╔╝██║ ╚═══██╗  ██╔══██╗  ╚██╔╝  ██╔═══╝ ██╔══██║╚════██║╚════██║██╔══╝  ██╔══██╗
@@ -77,10 +89,14 @@ func init() {
 	rootCmd.Flags().StringVarP(&targetURL, "url", "u", "", "Target URL (Required)")
 	rootCmd.Flags().StringVarP(&wordlistPath, "wordlist", "w", "", "Path to wordlist file (Optional)")
 	rootCmd.Flags().StringVarP(&cookieString, "cookie", "c", "", "Raw session cookie (e.g., 'JSESSIONID=xxx')")
-	rootCmd.Flags().StringVarP(&proxyURL, "proxy", "", "", "Proxy URL (e.g. http://127.0.0.1:8080)")
+	rootCmd.Flags().StringVarP(&proxyURL, "proxy", "p", "", "Proxy URL (e.g. http://127.0.0.1:8080)")
+	rootCmd.Flags().StringVarP(&outputFile, "output", "o", "results.txt", "Output file for results")
 	rootCmd.Flags().IntVarP(&threads, "threads", "t", 10, "Number of concurrent threads")
-	rootCmd.Flags().IntVarP(&delay, "delay", "", 0, "Delay between requests in milliseconds (ms)")
-	rootCmd.Flags().BoolVarP(&deepMode, "deep", "", false, "Enable Deep Scan Mode (Nested Fuzzing)")
+	rootCmd.Flags().IntVarP(&timeout, "timeout", "T", 10, "HTTP request timeout in seconds")
+	rootCmd.Flags().IntVarP(&delay, "delay", "d", 0, "Delay between requests in milliseconds (ms)")
+	rootCmd.Flags().BoolVarP(&deepMode, "deep", "D", false, "Enable Deep Scan Mode (Nested Fuzzing)")
+	rootCmd.Flags().BoolVarP(&verboseMode, "verbose", "v", false, "Show errors and failed requests")
+	rootCmd.Flags().IntSliceVarP(&showCodes, "show-codes", "s", []int{200}, "HTTP status codes to report (e.g. -s 200,301,302)")
 	rootCmd.Flags().StringSliceVarP(&customHeaders, "header", "H", []string{}, "Custom Header (e.g. -H 'Auth: Bearer 123')")
 }
 
@@ -101,28 +117,30 @@ func startScan() {
 
 	baseURL := strings.TrimRight(targetURL, "/")
 
-	finalWordlistPath := wordlistPath
-	if finalWordlistPath == "" {
-		finalWordlistPath = "wordlists/common.txt"
-		if _, err := os.Stat(finalWordlistPath); os.IsNotExist(err) {
-			fmt.Printf("%s[!] Error: Default wordlist not found at %s\n", ColorRed, finalWordlistPath)
-			fmt.Printf("[i] Please provide a wordlist path with -w.%s\n", ColorReset)
+	var wordlistReader io.Reader
+	if wordlistPath != "" {
+		f, err := os.Open(wordlistPath)
+		if err != nil {
+			fmt.Printf("%s[!] Wordlist Error: %v%s\n", ColorRed, err, ColorReset)
 			os.Exit(1)
 		}
-		fmt.Printf("%s[*] No wordlist provided. Using default: %s%s\n", ColorCyan, finalWordlistPath, ColorReset)
+		defer f.Close()
+		wordlistReader = f
+		fmt.Printf("%s[*] Wordlist: %s%s\n", ColorCyan, wordlistPath, ColorReset)
+	} else {
+		wordlistReader = strings.NewReader(defaultWordlist)
+		fmt.Printf("%s[*] No wordlist provided. Using embedded default wordlist.%s\n", ColorCyan, ColorReset)
 	}
 
-	file, err := os.Open(finalWordlistPath)
-	if err != nil {
-		fmt.Printf("%s[!] Wordlist Error: %v%s\n", ColorRed, err, ColorReset)
-		os.Exit(1)
-	}
-	defer file.Close()
-
+	seen := make(map[string]bool)
 	var directories []string
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(wordlistReader)
 	for scanner.Scan() {
-		directories = append(directories, scanner.Text())
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") && !seen[line] {
+			seen[line] = true
+			directories = append(directories, line)
+		}
 	}
 
 	var transport *http.Transport
@@ -145,43 +163,73 @@ func startScan() {
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   10 * time.Second,
+		Timeout:   time.Duration(timeout) * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
 
-	if _, err := os.Stat("results.txt"); os.IsNotExist(err) {
-		saveResult("--- 403Bypasser Scan Results ---")
-	}
+	scanHeader := fmt.Sprintf("\n--- 403Bypasser Scan | Target: %s | Time: %s ---",
+		baseURL, time.Now().Format("2006-01-02 15:04:05"))
+	saveResult(scanHeader)
 
 	fmt.Printf("%s[*] Target: %s\n", ColorYellow, baseURL)
-	
+
 	calibrate(client, baseURL, customHeadersMap)
 
 	fmt.Printf("[*] Threads: %d\n", threads)
+	fmt.Printf("[*] Timeout: %ds\n", timeout)
 	if delay > 0 {
 		fmt.Printf("[*] Delay: %d ms\n", delay)
 	}
-	
+
 	mode := "Standard"
 	if deepMode {
 		mode = "Deep Scan"
 	}
+
+	samplePayloads := generatePathPayloads("sample")
+	sampleHeaders := generateHeaders("/sample")
+	payloadCount := int64(len(samplePayloads))
+	headerCount := int64(len(sampleHeaders))
+	dirCount := int64(len(directories))
+
+	var estimatedRequests int64
+	if deepMode {
+		estimatedRequests = dirCount * payloadCount * headerCount * 2
+	} else {
+		estimatedRequests = dirCount * (payloadCount*6 + headerCount)
+	}
+
 	fmt.Printf("[*] Mode: %s\n", mode)
+	fmt.Printf("[*] Output: %s\n", outputFile)
+	fmt.Printf("[*] Show Codes: %v\n", showCodes)
 	fmt.Printf("[*] Custom Headers: %d\n", len(customHeadersMap))
-	fmt.Printf("[*] Paths to Scan: %d\n", len(directories))
+	fmt.Printf("[*] Paths to Scan: %d (after dedup)\n", len(directories))
+	fmt.Printf("[*] Estimated Requests: ~%s\n", formatCount(estimatedRequests))
+
+	if deepMode && estimatedRequests > 500_000 {
+		fmt.Printf("%s[!] Deep mode warning: ~%s requests. Consider using --delay to avoid rate limiting.%s\n",
+			ColorYellow, formatCount(estimatedRequests), ColorReset)
+	}
+
 	fmt.Println("------------------------------------------------------------" + ColorReset)
 
-	jobs := make(chan string, len(directories))
+	jobs := make(chan string, threads*2)
 	var wg sync.WaitGroup
+	var processedCount atomic.Int64
+	total := int64(len(directories))
 
 	for i := 0; i < threads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for dir := range jobs {
-				processDirectory(client, baseURL, dir, cookieString, customHeadersMap, deepMode, delay)
+				processDirectory(client, baseURL, dir, cookieString, customHeadersMap)
+				count := processedCount.Add(1)
+				printLock.Lock()
+				fmt.Printf("\r%s[*] Progress: %d/%d%s", ColorCyan, count, total, ColorReset)
+				printLock.Unlock()
 			}
 		}()
 	}
@@ -192,59 +240,68 @@ func startScan() {
 	close(jobs)
 
 	wg.Wait()
-	fmt.Printf("\n%s[*] Scan Complete. Results saved to 'results.txt'.%s\n", ColorGreen, ColorReset)
+	fmt.Printf("\n%s[*] Scan Complete. Results saved to '%s'.%s\n", ColorGreen, outputFile, ColorReset)
 }
 
 func saveResult(result string) {
 	fileMutex.Lock()
 	defer fileMutex.Unlock()
 
-	f, err := os.OpenFile("results.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 
-	if _, err := f.WriteString(result + "\n"); err != nil {
-		return
-	}
+	f.WriteString(result + "\n")
 }
 
 func calibrate(client *http.Client, baseURL string, customHeaders map[string]string) {
 	fmt.Println(ColorYellow + "[*] Starting Calibration..." + ColorReset)
 
-	randomURL := baseURL + "/calibration_check_random_string_xyz_999"
-	req404, _ := http.NewRequest("GET", randomURL, nil)
-	req404.Header.Set("User-Agent", DefaultUserAgent)
-	
-	for k, v := range customHeaders {
-		req404.Header.Set(k, v)
-	}
-	
-	resp404, err := client.Do(req404)
+	randomURL := fmt.Sprintf("%s/calibration_%d", baseURL, time.Now().UnixNano())
+
+	req404, err := http.NewRequest("GET", randomURL, nil)
 	if err == nil {
-		bodyBytes, _ := io.ReadAll(resp404.Body)
-		calibrationSize404 = len(bodyBytes)
-		resp404.Body.Close()
-		fmt.Printf("[i] 404 (Not Found) Calibration Size: ~%d bytes\n", calibrationSize404)
+		req404.Header.Set("User-Agent", DefaultUserAgent)
+		for k, v := range customHeaders {
+			req404.Header.Set(k, v)
+		}
+		resp404, err := client.Do(req404)
+		if err == nil {
+			bodyBytes, _ := io.ReadAll(resp404.Body)
+			resp404.Body.Close()
+			calibrationSize404 = len(bodyBytes)
+			calibrationOK404 = true
+			fmt.Printf("[i] 404 (Not Found) Calibration Size: ~%d bytes\n", calibrationSize404)
+		} else {
+			fmt.Printf("%s[!] 404 Calibration failed: %v%s\n", ColorRed, err, ColorReset)
+		}
 	}
 
-	reqRoot, _ := http.NewRequest("GET", baseURL+"/", nil)
-	reqRoot.Header.Set("User-Agent", DefaultUserAgent)
-	
-	for k, v := range customHeaders {
-		reqRoot.Header.Set(k, v)
-	}
-
-	respRoot, err := client.Do(reqRoot)
+	reqRoot, err := http.NewRequest("GET", baseURL+"/", nil)
 	if err == nil {
-		bodyBytes, _ := io.ReadAll(respRoot.Body)
-		calibrationSizeRoot = len(bodyBytes)
-		respRoot.Body.Close()
-		fmt.Printf("[i] Root (Homepage) Calibration Size: ~%d bytes\n", calibrationSizeRoot)
+		reqRoot.Header.Set("User-Agent", DefaultUserAgent)
+		for k, v := range customHeaders {
+			reqRoot.Header.Set(k, v)
+		}
+		respRoot, err := client.Do(reqRoot)
+		if err == nil {
+			bodyBytes, _ := io.ReadAll(respRoot.Body)
+			respRoot.Body.Close()
+			calibrationSizeRoot = len(bodyBytes)
+			calibrationOKRoot = true
+			fmt.Printf("[i] Root (Homepage) Calibration Size: ~%d bytes\n", calibrationSizeRoot)
+		} else {
+			fmt.Printf("%s[!] Root Calibration failed: %v%s\n", ColorRed, err, ColorReset)
+		}
 	}
 
-	fmt.Printf("[i] Anti-False Positive Active: Hiding responses within +/- 100 bytes of calibration data.%s\n", ColorReset)
+	if calibrationOK404 || calibrationOKRoot {
+		fmt.Printf("[i] Anti-False Positive Active: Hiding 200 responses within +/- 100 bytes of calibration data.%s\n", ColorReset)
+	} else {
+		fmt.Printf("%s[!] Calibration completely failed. False positive filtering disabled.%s\n", ColorRed, ColorReset)
+	}
 	fmt.Println("------------------------------------------------------------")
 }
 
@@ -265,10 +322,14 @@ func generateHeaders(targetPath string) []map[string]string {
 		}
 	}
 
-	overrideHeaders := []string{"X-Original-URL", "X-Rewrite-URL", "X-Forwarded-URL", "X-Forwarded-Scheme"}
-	for _, key := range overrideHeaders {
+	// URL override headers take a path value
+	for _, key := range []string{"X-Original-URL", "X-Rewrite-URL", "X-Forwarded-URL"} {
 		headersList = append(headersList, map[string]string{key: targetPath})
 	}
+
+	// X-Forwarded-Scheme takes a scheme, not a path
+	headersList = append(headersList, map[string]string{"X-Forwarded-Scheme": "http"})
+	headersList = append(headersList, map[string]string{"X-Forwarded-Scheme": "https"})
 
 	headersList = append(headersList, map[string]string{"Request-Uri": "127.0.0.1"})
 	headersList = append(headersList, map[string]string{"Request-Uri": "localhost"})
@@ -279,7 +340,7 @@ func generateHeaders(targetPath string) []map[string]string {
 	headersList = append(headersList, map[string]string{"Referer": "http://127.0.0.1"})
 	headersList = append(headersList, map[string]string{"Referer": "https://127.0.0.1"})
 	headersList = append(headersList, map[string]string{"Referer": "http://localhost/" + targetPath})
-	
+
 	headersList = append(headersList, map[string]string{"Range": "bytes=0-"})
 	headersList = append(headersList, map[string]string{"X-HTTP-Method-Override": "POST"})
 
@@ -326,7 +387,6 @@ func generatePathPayloads(originalPath string) []string {
 
 		fmt.Sprintf("/%s/..;/", cleanPath),
 		fmt.Sprintf("/%s/..;/;", cleanPath),
-		fmt.Sprintf("/admin/..;/%s", cleanPath),
 		fmt.Sprintf("/%s/../", cleanPath),
 		fmt.Sprintf("/%s/..%%00/", cleanPath),
 		fmt.Sprintf("/%s/..%%0d/", cleanPath),
@@ -352,18 +412,66 @@ func generatePathPayloads(originalPath string) []string {
 		fmt.Sprintf("/%s#", cleanPath),
 	}
 
-	return payloads
+	return deduplicatePayloads(payloads)
+}
+
+func deduplicatePayloads(payloads []string) []string {
+	seen := make(map[string]bool, len(payloads))
+	result := make([]string, 0, len(payloads))
+	for _, p := range payloads {
+		if !seen[p] {
+			seen[p] = true
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+func isTargetStatus(status int) bool {
+	for _, code := range showCodes {
+		if code == status {
+			return true
+		}
+	}
+	return false
+}
+
+func colorForStatus(status int) string {
+	switch {
+	case status == 200:
+		return ColorGreen
+	case status >= 300 && status < 400:
+		return ColorYellow
+	case status >= 500:
+		return ColorRed
+	default:
+		return ColorCyan
+	}
+}
+
+func formatCount(n int64) string {
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+	if n >= 1_000 {
+		return fmt.Sprintf("%.1fK", float64(n)/1_000)
+	}
+	return fmt.Sprintf("%d", n)
 }
 
 func sendRequest(client *http.Client, targetURL string, cookies string, headers map[string]string, customHeaders map[string]string, method, label string) {
 	req, err := http.NewRequest(method, targetURL, nil)
 	if err != nil {
+		if verboseMode {
+			printLock.Lock()
+			fmt.Printf("\n%s[!] Request build error: %v | URL: %s%s\n", ColorRed, err, targetURL, ColorReset)
+			printLock.Unlock()
+		}
 		return
 	}
 
-	if cookies != "" {
-		req.Header.Set("Cookie", cookies)
-	}
+	// Set default User-Agent first so -H "User-Agent: X" can override it
+	req.Header.Set("User-Agent", DefaultUserAgent)
 
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -377,10 +485,17 @@ func sendRequest(client *http.Client, targetURL string, cookies string, headers 
 		}
 	}
 
-	req.Header.Set("User-Agent", DefaultUserAgent)
+	if cookies != "" {
+		req.Header.Set("Cookie", cookies)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if verboseMode {
+			printLock.Lock()
+			fmt.Printf("\n%s[!] Request failed: %v | URL: %s%s\n", ColorRed, err, targetURL, ColorReset)
+			printLock.Unlock()
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -392,32 +507,48 @@ func sendRequest(client *http.Client, targetURL string, cookies string, headers 
 	size := len(bodyBytes)
 	status := resp.StatusCode
 
-	diff404 := int(math.Abs(float64(size - calibrationSize404)))
-	diffRoot := int(math.Abs(float64(size - calibrationSizeRoot)))
-	isFalsePositive := diff404 < 100 || diffRoot < 100
+	// HEAD and OPTIONS never return a body; allow them through the size check
+	sizeOK := size > 0 || method == "HEAD" || method == "OPTIONS"
 
-	if status == 200 && !isFalsePositive && size > 0 {
-		logMessage := fmt.Sprintf("[+] FOUND (200) | %s | %s | URL: %s | Size: %d", method, label, targetURL, size)
-		
+	// False positive filtering only applies to 200 responses with a body
+	isFalsePositive := false
+	if status == 200 && method != "HEAD" && method != "OPTIONS" {
+		if calibrationOK404 {
+			diff404 := int(math.Abs(float64(size - calibrationSize404)))
+			if diff404 < 100 {
+				isFalsePositive = true
+			}
+		}
+		if calibrationOKRoot && !isFalsePositive {
+			diffRoot := int(math.Abs(float64(size - calibrationSizeRoot)))
+			if diffRoot < 100 {
+				isFalsePositive = true
+			}
+		}
+	}
+
+	if isTargetStatus(status) && sizeOK && !isFalsePositive {
+		logMessage := fmt.Sprintf("[+] FOUND (%d) | %s | %s | URL: %s | Size: %d",
+			status, method, label, targetURL, size)
+
+		color := colorForStatus(status)
 		printLock.Lock()
-		fmt.Printf("%s%s%s\n", ColorGreen, logMessage, ColorReset)
+		fmt.Printf("\n%s%s%s\n", color, logMessage, ColorReset)
 		printLock.Unlock()
 
 		saveResult(logMessage)
 	}
 }
 
-func processDirectory(client *http.Client, baseURL, directory, cookies string, customHeaders map[string]string, deepMode bool, delay int) {
+func processDirectory(client *http.Client, baseURL, directory, cookies string, customHeaders map[string]string) {
 	directory = strings.TrimSpace(directory)
 	if directory == "" {
 		return
 	}
 
-	cleanDir := strings.TrimLeft(directory, "/")
-	fullPathSuffix := "/" + cleanDir
-
 	pathPayloads := generatePathPayloads(directory)
-	headersList := generateHeaders(fullPathSuffix)
+	cleanDir := strings.TrimLeft(directory, "/")
+	headersList := generateHeaders("/" + cleanDir)
 
 	applyDelay := func() {
 		if delay > 0 {
@@ -425,12 +556,13 @@ func processDirectory(client *http.Client, baseURL, directory, cookies string, c
 		}
 	}
 
+	standardMethods := []string{"GET", "POST", "TRACE", "HEAD", "OPTIONS", "PUT"}
+
 	if deepMode {
 		for _, path := range pathPayloads {
 			target := baseURL + path
 			for _, header := range headersList {
 				applyDelay()
-				
 				var headerKey string
 				for k := range header {
 					headerKey = k
@@ -441,28 +573,26 @@ func processDirectory(client *http.Client, baseURL, directory, cookies string, c
 			}
 		}
 	} else {
-		for _, path := range pathPayloads {
+		for i, path := range pathPayloads {
 			target := baseURL + path
-			
-			applyDelay()
-			sendRequest(client, target, cookies, nil, customHeaders, "GET", "Path Fuzz")
-			
-			applyDelay()
-			sendRequest(client, target, cookies, nil, customHeaders, "POST", "Method:POST")
-			
-			applyDelay()
-			sendRequest(client, target, cookies, nil, customHeaders, "TRACE", "Method:TRACE")
-		}
 
-		target := baseURL + fullPathSuffix
-		for _, header := range headersList {
-			applyDelay()
-			var headerKey string
-			for k := range header {
-				headerKey = k
-				break
+			for _, method := range standardMethods {
+				applyDelay()
+				sendRequest(client, target, cookies, nil, customHeaders, method, "Method:"+method)
 			}
-			sendRequest(client, target, cookies, header, customHeaders, "GET", "Hdr:"+headerKey)
+
+			// Header fuzzing only on the canonical path to avoid redundant combinations
+			if i == 0 {
+				for _, header := range headersList {
+					applyDelay()
+					var headerKey string
+					for k := range header {
+						headerKey = k
+						break
+					}
+					sendRequest(client, target, cookies, header, customHeaders, "GET", "Hdr:"+headerKey)
+				}
+			}
 		}
 	}
 }
